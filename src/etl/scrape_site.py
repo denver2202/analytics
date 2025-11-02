@@ -5,10 +5,21 @@
 import time
 import json
 import requests
-from selectolax.parser import HTMLParser
 from loguru import logger
 from typing import List, Dict, Optional
 from urllib.parse import urljoin
+
+# Пробуем использовать selectolax, если не работает - используем BeautifulSoup
+try:
+    from selectolax.parser import HTMLParser
+    USE_SELECTOLAX = True
+except (ImportError, SystemError, OSError):
+    try:
+        from bs4 import BeautifulSoup
+        USE_SELECTOLAX = False
+        logger.info("Используется BeautifulSoup вместо selectolax")
+    except ImportError:
+        raise ImportError("Необходим selectolax или beautifulsoup4")
 
 from ..config import SCRAPE_BASE_URL, REQUESTS_TIMEOUT, REQUESTS_SLEEP_BETWEEN, USER_AGENT
 
@@ -17,16 +28,37 @@ class ProductScraper:
     """Парсер товаров с сайта предприятия"""
     
     def __init__(self):
-        self.base_url = SCRAPE_BASE_URL or "https://www.jsc-niir.ru"
+        base = SCRAPE_BASE_URL or "https://www.jsc-niir.ru"
+        # Нормализуем base_url - оставляем только домен, без пути
+        if base.startswith("http"):
+            # Извлекаем только домен
+            from urllib.parse import urlparse
+            parsed = urlparse(base)
+            base = f"{parsed.scheme}://{parsed.netloc}"
+        # Убираем лишние слэши
+        if base.endswith("/"):
+            base = base.rstrip("/")
+        self.base_url = base
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
     
-    def get_page(self, url: str) -> Optional[HTMLParser]:
+    def get_page(self, url: str):
         """Получить HTML страницы"""
         try:
             response = self.session.get(url, timeout=REQUESTS_TIMEOUT)
             response.raise_for_status()
-            return HTMLParser(response.text)
+            
+            if USE_SELECTOLAX:
+                try:
+                    return HTMLParser(response.text)
+                except (SystemError, OSError, MemoryError) as e:
+                    logger.warning(f"selectolax вызвал ошибку, переключаюсь на BeautifulSoup: {e}")
+                    from bs4 import BeautifulSoup
+                    return BeautifulSoup(response.text, 'html.parser')
+            else:
+                from bs4 import BeautifulSoup
+                return BeautifulSoup(response.text, 'html.parser')
+                
         except Exception as e:
             logger.error(f"Ошибка при запросе {url}: {e}")
             return None
@@ -35,23 +67,222 @@ class ProductScraper:
         """Извлечь товары со страницы каталога"""
         products = []
         
-        # Ищем карточки товаров (структура может отличаться, нужно адаптировать под реальный HTML)
-        # Типичные селекторы для карточек товаров
-        product_cards = html.css("div.product-item, div.product-card, article.product, .product")
+        # Для страницы шин: ищем товары по разным селекторам
+        # Структура сайта: товары в блоках с названиями и ссылками "Подробнее"
         
-        if not product_cards:
-            # Альтернативные селекторы
-            product_cards = html.css("a.product-link, .goods-item")
+        # Вариант 1: Ищем ссылки "Подробнее" и берем предыдущий элемент с названием
+        detail_links = html.css('a[href*="shini"], a:contains("Подробнее"), a[href*="product"]')
         
-        for card in product_cards:
+        # Вариант 2: Ищем заголовки разделов (h2) и следующие за ними товары
+        sections = html.css("h2, h3")
+        current_category = None
+        
+        # Вариант 3: Ищем все ссылки и фильтруем по контексту
+        all_links = html.css("a")
+        
+        # Вариант 4: Ищем по структуре страницы - товары в списках/блоках
+        # Попробуем найти блоки с товарами через контекст
+        product_blocks = []
+        
+        # Ищем в секциях (для страницы шин структура может быть в div или списках)
+        if USE_SELECTOLAX and hasattr(html, 'css'):
+            content_blocks = html.css("div, section, article, li")
+        else:
+            # BeautifulSoup
+            content_blocks = html.find_all(["div", "section", "article", "li"])
+        
+        for block in content_blocks:
+            # Ищем блоки, которые содержат название товара (например, "К-83А") и ссылку
+            if USE_SELECTOLAX and hasattr(block, 'text'):
+                text = block.text(strip=True)
+                links = block.css("a")
+            else:
+                # BeautifulSoup
+                text = block.get_text(strip=True) if hasattr(block, 'get_text') else ""
+                links = block.find_all("a") if hasattr(block, 'find_all') else []
+            
+            # Если в блоке есть ссылка и текст похож на название шины
+            if links and text:
+                # Проверяем, не является ли это товаром (содержит артикул/модель)
+                # Названия шин обычно содержат тире, цифры, буквы (например "К-83А 420/70-457")
+                import re
+                tire_pattern = r'[КМ]-\d+[А-Я]?\s+\d+[/-]\d+[A-Z]?\d*|КИ-\d+'
+                if re.search(tire_pattern, text) or any(char in text for char in ['/', 'R', '-']) and len(text) < 100:
+                    # Это похоже на товар
+                    product_blocks.append(block)
+        
+        # Если нашли блоки через паттерн, обрабатываем их
+        if product_blocks:
+            for block in product_blocks:
+                try:
+                    product_data = self._extract_product_from_block(block)
+                    if product_data:
+                        products.append(product_data)
+                except Exception as e:
+                    logger.debug(f"Ошибка при парсинге блока: {e}")
+        
+        # Если ничего не нашли, пробуем альтернативный метод - ищем все ссылки и их контекст
+        if not products:
+            logger.debug("Пробуем альтернативный метод парсинга через ссылки")
+            products = self._extract_from_links(html)
+        
+        # Удаляем дубликаты
+        seen = set()
+        unique_products = []
+        for p in products:
+            key = (p.get("name"), p.get("sku"))
+            if key not in seen:
+                seen.add(key)
+                unique_products.append(p)
+        
+        return unique_products
+    
+    def _extract_from_links(self, html) -> List[Dict]:
+        """Альтернативный метод: извлечение товаров из ссылок"""
+        import re
+        products = []
+        
+        # Ищем все ссылки
+        if USE_SELECTOLAX and hasattr(html, 'css'):
+            links = html.css("a")
+            headings = html.css("h1, h2, h3")
+        else:
+            # BeautifulSoup
+            links = html.find_all("a")
+            headings = html.find_all(["h1", "h2", "h3"])
+        
+        current_category = None
+        
+        # Сначала определяем категории по заголовкам
+        for heading in headings:
+            if USE_SELECTOLAX and hasattr(heading, 'text'):
+                text = heading.text(strip=True)
+            else:
+                text = heading.get_text(strip=True) if hasattr(heading, 'get_text') else ""
+            if "грузов" in text.lower() and "легко" not in text.lower():
+                current_category = "Грузовые шины"
+            elif "легко" in text.lower():
+                current_category = "Легко Грузовые шины"
+        
+        # Обрабатываем ссылки
+        for link in links:
             try:
-                product_data = self._extract_product_data(card)
-                if product_data:
-                    products.append(product_data)
+                if USE_SELECTOLAX and hasattr(link, 'attributes'):
+                    href = link.attributes.get("href", "")
+                    link_text = link.text(strip=True)
+                    parent = link.parent
+                else:
+                    # BeautifulSoup
+                    href = link.get("href", "")
+                    link_text = link.get_text(strip=True)
+                    parent = link.parent if hasattr(link, 'parent') else None
+                if not parent:
+                    continue
+                
+                # Получаем полный текст родительского элемента
+                if parent:
+                    if USE_SELECTOLAX and hasattr(parent, 'text'):
+                        parent_text = parent.text(strip=True)
+                    else:
+                        parent_text = parent.get_text(strip=True) if hasattr(parent, 'get_text') else ""
+                else:
+                    parent_text = ""
+                
+                # Ищем паттерн названия шины (например: "К-83А 420/70-457" или "КИ-115АМ (САДКО) 12R18")
+                tire_pattern = r'(К-?\d+[А-Яа-я]?|КИ-?\d+[А-Яа-яА-Яа-я]*)\s*\(?[А-Яа-я]*\)?\s*(\d+[/-]\d+[A-Z]?\d*|\d+R\d+)'
+                
+                # Если ссылка содержит "Подробнее" или ссылка ведет на страницу товара
+                if "Подробнее" in link_text or "подробнее" in link_text.lower() or "shini" in href:
+                    # Берем текст перед ссылкой или весь текст родителя
+                    if "Подробнее" in parent_text:
+                        # Разделяем по "Подробнее" и берем первую часть
+                        name_part = parent_text.split("Подробнее")[0].strip()
+                        # Убираем лишние пробелы и переносы строк
+                        name_part = re.sub(r'\s+', ' ', name_part)
+                    else:
+                        # Пробуем найти название в родителе
+                        name_part = parent_text.strip()
+                        # Убираем "Подробнее" если есть
+                        name_part = re.sub(r'\s*Подробнее.*', '', name_part, flags=re.IGNORECASE)
+                    
+                    # Извлекаем название товара (первая строка с паттерном)
+                    if name_part and len(name_part) > 3:
+                        # Ищем паттерн шины в тексте
+                        match = re.search(tire_pattern, name_part)
+                        if match:
+                            # Берем найденную часть как название
+                            name = match.group(0).strip()
+                            
+                            # Определяем категорию
+                            category = current_category or "Шины"
+                            parent_lower = parent_text.lower()
+                            if "грузов" in parent_lower and "легко" not in parent_lower:
+                                category = "Грузовые шины"
+                            elif "легко" in parent_lower:
+                                category = "Легко Грузовые шины"
+                            
+                            # Формируем URL
+                            if href.startswith("/"):
+                                url = urljoin(self.base_url, href)
+                            elif href.startswith("http"):
+                                url = href
+                            else:
+                                url = urljoin(self.base_url, "/" + href)
+                            
+                            products.append({
+                                "name": name,
+                                "sku": self._generate_sku(name),
+                                "category": category,
+                                "url": url,
+                                "tread_pattern": None
+                            })
             except Exception as e:
-                logger.warning(f"Ошибка при парсинге карточки товара: {e}")
+                logger.debug(f"Ошибка при обработке ссылки: {e}")
         
         return products
+    
+    def _extract_product_from_block(self, block) -> Optional[Dict]:
+        """Извлечь товар из блока"""
+        try:
+            # Название товара
+            name_elem = block.css_first("strong, b, h3, h4, a")
+            if not name_elem:
+                # Пробуем найти в тексте блока
+                text = block.text(strip=True)
+                # Извлекаем первую строку как название
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                name = lines[0] if lines else None
+            else:
+                name = name_elem.text(strip=True)
+            
+            if not name or len(name) < 3:
+                return None
+            
+            # Ссылка
+            link_elem = block.css_first("a")
+            url = None
+            if link_elem:
+                href = link_elem.attributes.get("href")
+                if href:
+                    url = urljoin(self.base_url, href)
+            
+            # Категория - определяем по контексту (смотрим заголовки выше)
+            category = "Шины"
+            text_lower = block.text().lower()
+            if "грузов" in text_lower and "легко" not in text_lower:
+                category = "Грузовые шины"
+            elif "легко" in text_lower or "легк" in text_lower:
+                category = "Легко Грузовые шины"
+            
+            return {
+                "name": name,
+                "sku": self._generate_sku(name),
+                "category": category,
+                "url": url
+            }
+        except Exception as e:
+            logger.debug(f"Ошибка извлечения из блока: {e}")
+            return None
     
     def _extract_product_data(self, card) -> Optional[Dict]:
         """Извлечь данные одного товара"""
@@ -181,7 +412,40 @@ class ProductScraper:
         products = []
         
         if not category_url:
-            category_url = f"{self.base_url}/produkciya-2/"
+            # Если SCRAPE_BASE_URL уже содержит путь, используем его напрямую
+            if SCRAPE_BASE_URL and SCRAPE_BASE_URL != "https://www.jsc-niir.ru":
+                category_url = SCRAPE_BASE_URL
+            else:
+                category_url = f"{self.base_url}/produkciya-2/"
+        
+        # Нормализуем URL
+        if not category_url.startswith("http"):
+            if category_url.startswith("/"):
+                category_url = f"{self.base_url}{category_url}"
+            else:
+                category_url = f"{self.base_url}/{category_url}"
+        
+        # Убираем лишние слэши и нормализуем
+        category_url = category_url.rstrip("/")
+        
+        # Исправляем дублирование пути, если base_url уже содержит путь
+        base_domain = "https://www.jsc-niir.ru"
+        if self.base_url.startswith(base_domain):
+            # Если base_url содержит путь
+            base_path = self.base_url.replace(base_domain, "")
+            if base_path:
+                # Если category_url дублирует путь из base_url
+                remaining = category_url.replace(self.base_url, "")
+                if remaining.startswith(base_path):
+                    # Убираем дублирование
+                    category_url = self.base_url + remaining.replace(base_path, "", 1)
+                elif category_url.startswith(self.base_url):
+                    # Уже правильно сформирован
+                    pass
+                else:
+                    # Если category_url - относительный путь
+                    if not category_url.startswith("http"):
+                        category_url = base_domain + "/" + category_url.lstrip("/")
         
         page_num = 1
         while page_num <= max_pages:
