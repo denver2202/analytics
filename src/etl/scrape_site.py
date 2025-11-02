@@ -3,6 +3,7 @@
 Извлекает товары, категории и их характеристики
 """
 import time
+import json
 import requests
 from selectolax.parser import HTMLParser
 from loguru import logger
@@ -123,7 +124,8 @@ class ProductScraper:
             except Exception:
                 continue
         
-        details["specifications"] = specs
+        # Сохраняем характеристики в JSON формате
+        details["specifications"] = json.dumps(specs, ensure_ascii=False) if specs else None
         
         # Извлечение типа протектора для шин
         tread_pattern = self._extract_tread_pattern(specs, html)

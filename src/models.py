@@ -10,6 +10,8 @@ class Product(Base):
     name = Column(String(255), nullable=False)
     category = Column(String(128))
     url = Column(String(512))  # ссылка на карточку товара
+    tread_pattern = Column(String(64), index=True)  # тип протектора (для шин)
+    specifications = Column(String(2048))  # JSON строка с характеристиками
 
 class PriceSnapshot(Base):
     __tablename__ = "price_snapshots"  # ДВОЙНОЕ подчеркивание!
